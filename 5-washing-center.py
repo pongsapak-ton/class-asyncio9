@@ -5,7 +5,7 @@ import asyncio
 import aiomqtt
 from enum import Enum
 
-student_id = "6300001"
+student_id = "6310301020"
 
 # State 
 S_OFF       = 'OFF'
@@ -27,6 +27,13 @@ S_TIMEOUT               = 'TIMEOUT'
 S_MOTORFAILURE          = 'MOTORFAILURE'
 S_FAULTCLEARED          = 'FAULTCLEARED'
 
+async def cancel_waiting(task):
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        print(f'{time.ctime()} - Get message before timeout!')
+        
 async def publish_message(w, client, app, action, name, value):
     await asyncio.sleep(1)
     payload = {
@@ -44,6 +51,11 @@ async def publish_message(w, client, app, action, name, value):
 async def action(w, msg='', maxtime=100):
     print(f"{time.ctime()} - [{w.SERIAL}-{w.STATE}] Waiting for maxinum {maxtime} seconds")
     await asyncio.sleep(maxtime)
+
+async def wait_event(event):
+    print(f'{time.ctime()} Waiting for event ...')
+    await event.wait()
+    print(f'{time.ctime()} Get new information! ')
 
 async def actionWithinTime(w, client, nextstate, msg='', defaulttime=10):
     # fill water untill full level detected within 10 seconds if not full then timeout 
@@ -86,12 +98,16 @@ async def CoroWashingMachine(w, client):
         w.event = asyncio.Event()
         waiter_task = asyncio.create_task(waiter(w, w.event))
         await waiter_task
-        
+        w.event = asyncio.Event()
         if w.STATE == S_OFF:
             await publish_message(w, client, "app", "get", "STATUS", w.STATE)
+            waiter_task = asyncio.create_task(wait_event( w.event))
+            await waiter_task
 
         if w.STATE == S_FAULT:
             await publish_message(w, client, "app", "get", "STATUS", w.STATE)
+            waiter_task = asyncio.create_task(wait_event( w.event))
+            await waiter_task
 
         if w.STATE == S_READY:
             await publish_message(w, client, "app", "get", "STATUS", w.STATE)
@@ -111,21 +127,37 @@ async def CoroWashingMachine(w, client):
 
             # heat water untill  detected within 10 seconds if not full then timeout
             print(f"{time.ctime()} - [{w.SERIAL}-{w.STATE}] Heating water...")
+            w.STATE = S_HEATWATER
             await actionWithinTime(w, client, nextstate=S_WASH, msg='Heating water')
 
         # wash 10 seconds, if out of balance detected then fault
+        if w.STATE == S_WASH:
+            await publish_message(w, client, "app", "get", "STATUS", w.STATE)
+            print(f"{time.ctime()} - [{w.SERIAL}-{w.STATE}] Washing...")
+            w.STATE = S_WASH
+            await actionWithinTime(w, client, nextstate=S_RINSE, msg='Washing')
 
         # rinse 10 seconds, if motor failure detect then fault
+        if w.STATE == S_RINSE:
+            await publish_message(w, client, "app", "get", "STATUS", w.STATE)
+            print(f"{time.ctime()} - [{w.SERIAL}-{w.STATE}] Rinse...")
+            w.STATE = S_RINSE
+            await actionWithinTime(w, client, nextstate=S_SPIN, msg='Rinse')
 
         # spin 10 seconds, if motor failure detect then fault
+        if w.STATE == S_SPIN:
+            await publish_message(w, client, "app", "get", "STATUS", w.STATE)
+            print(f"{time.ctime()} - [{w.SERIAL}-{w.STATE}] Spin...")
+            w.STATE = S_SPIN
+            await actionWithinTime(w, client, nextstate=S_OFF, msg='Spin')
 
         # When washing is in FAULT state, wait until get FAULTCLEARED
-
-        wait_next = round(5*random.random(),2)
-        print(f"sleep {wait_next} seconds")
-        await asyncio.sleep(wait_next)
+      
             
-
+        # wait_next = round(5*random.random(),2)
+        # print(f"sleep {wait_next} seconds")
+        # await asyncio.sleep(wait_next)
+            
 async def listen(w, client):
     async with client.messages() as messages:
         await client.subscribe(f"v1cdti/hw/set/{student_id}/model-01/{w.SERIAL}")
@@ -151,19 +183,51 @@ async def listen(w, client):
                         w.Task.cancel()
                 elif (m_decode['name']=="STATUS" and m_decode['value']==S_FAULT):
                     w.STATE = S_FAULT
+                    if w.Task:
+                        w.Task.cancel()
+                elif (w.STATE==S_FAULT and m_decode['name']=="STATUS" and m_decode['value']==S_FAULTCLEARED):
+                    w.STATE = S_FAULTCLEARED
+                    if w.Task:
+                        w.Task.cancel()
+                elif (w.STATE==S_HEATWATER and m_decode['name']=="STATUS" and m_decode['value']==S_TEMPERATUREREACHED):
+                    w.STATE = S_TEMPERATUREREACHED
+                    if w.Task:
+                        w.Task.cancel()
+                elif (w.STATE==S_WASH and m_decode['name']=="STATUS" and m_decode['value']==S_FUNCTIONCOMPLETED):
+                    w.STATE = S_FUNCTIONCOMPLETED
+                    if w.Task:
+                        w.Task.cancel()
+                elif (w.STATE==S_RINSE and m_decode['name']=="STATUS" and m_decode['value']==S_FUNCTIONCOMPLETED):
+                    w.STATE = S_FUNCTIONCOMPLETED
+                    if w.Task:
+                        w.Task.cancel()
+                elif (w.STATE==S_SPIN and m_decode['name']=="STATUS" and m_decode['value']==S_FUNCTIONCOMPLETED):
+                    w.STATE = S_FUNCTIONCOMPLETED
+                    if w.Task:
+                        w.Task.cancel()
+                elif (m_decode['name']=="STATUS" and m_decode['value']==S_OFF):
+                    w.STATE = "OFF"
+                    if w.Task:
+                        w.Task.cancel()
+                elif (m_decode['name']=="STATUS" and m_decode['value']==S_FAULT):
+                    w.STATE = S_FAULT
                 elif (w.STATE==S_FAULT and m_decode['name']=="STATUS" and m_decode['value']==S_FAULTCLEARED):
                     w.STATE = S_FAULTCLEARED
                 elif (m_decode['name']=="STATUS" and m_decode['value']==S_OFF):
                     w.STATE = "OFF"
                 w.event.set()
 
-async def main():
-    machines = 10
-    wl = [WashingMachine(serial=f'SN-00{n}') for n in range(1,machines+1)]
-    async with aiomqtt.Client("broker.hivemq.com") as client:
-        l = [listen(w, client) for w in wl]
-        c = [CoroWashingMachine(w, client) for w in wl]
+    
 
-        await asyncio.gather(*l , *c)
+            
+
+async def main():
+    n = 2
+    ws = [WashingMachine(serial=f'SN-00{i}') for i in range(n)]
+
+    async with aiomqtt.Client("broker.hivemq.com") as client:
+        listeners = [listen(w, client) for w in ws]
+        washer = [CoroWashingMachine(w, client) for w in ws]
+        await asyncio.gather(*listeners, *washer)
 
 asyncio.run(main())
